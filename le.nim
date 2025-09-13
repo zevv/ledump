@@ -101,15 +101,6 @@ let p = peg("btmon", ev: Evdata):
   S <- *' '
 
 
-  var ev: Evdata
-  let r = p.match(data, ev)
-  echo r.ok
-  echo ev
-  echo data[0..r.matchLen-1]
-  quit(0)
-
-
-
 proc handle_btmon(scanner: Scanner, lines: seq[string]) =
   let blob = lines.join("\n")
   var ev: Evdata
