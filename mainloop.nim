@@ -12,10 +12,17 @@ type
 
   TimerHandlerFn = proc(): bool
 
+  SigHandlerFn = proc(signo: cint): bool
+
   FdHandler = ref object
     fd: cint
     events: int16
     fn: FdHandlerFn
+
+  SigHandler = ref object
+    signo: cint
+    fn: SigHandlerFn
+    fdh: FdHandler
 
   TimerHandler = ref object
     interval: float
@@ -24,15 +31,18 @@ type
 
   MainLoop* = ref object
     t_now: float
+    running: bool
     fds: HashSet[FdHandler]
     timers: HashSet[TimerHandler]
+    signals: HashSet[SigHandler]
 
+  
+proc signalfd(fd: cint, mask: var Sigset, flags: cint): cint
+             {.cdecl, importc: "signalfd", header: "<sys/signalfd.h>".}
 
-proc hash(th: TimerHandler): Hash =
-  result = hash(th.fn)
-
-proc hash(fh: FdHandler): Hash =
-  result = hash(fh.fn)
+proc hash(th: TimerHandler): Hash = result = hash(th.fn)
+proc hash(fh: FdHandler): Hash = result = hash(fh.fn)
+proc hash(sh: SigHandler): Hash = result = hash(sh.fn)
 
 
 proc hirestime(): float = 
@@ -42,14 +52,16 @@ proc hirestime(): float =
 
 
 proc newMainLoop*(): MainLoop =
-  new result
+  let loop = new MainLoop
+  loop.running = true
+  loop
 
 
 proc time*(mainloop: MainLoop): float =
   result = mainloop.t_now
 
 
-proc add_fd(mainloop: MainLoop, fd: cint, events: int16, fn: FdHandlerFn): FdHandler =
+proc add_fd(mainloop: MainLoop, fd: cint, events: int16, fn: FdHandlerFn): FdHandler {.discardable.} =
   var fh = new FdHandler
   fh.fd = fd
   fh.events = events
@@ -62,7 +74,8 @@ proc del_fd(mainloop: MainLoop, fh: FdHandler) =
   mainloop.fds.excl fh
 
 
-proc add_timer*(mainloop: Mainloop, interval: float, fn: TimerHandlerFn): TimerHandler =
+
+proc add_timer*(mainloop: Mainloop, interval: float, fn: TimerHandlerFn): TimerHandler {.discardable.} =
   var th = new TimerHandler
   th.interval = interval
   th.t_next = hirestime() + interval
@@ -73,6 +86,31 @@ proc add_timer*(mainloop: Mainloop, interval: float, fn: TimerHandlerFn): TimerH
 
 proc del_timer(mainloop: MainLoop, th: TimerHandler) =
   mainloop.timers.excl th
+
+
+
+proc add_signal*(mainloop: MainLoop, signo: cint, fn: FdHandlerFn): SigHandler {.discardable.} =
+  let sh = new SigHandler
+  sh.signo = signo
+  sh.fn = fn
+  mainloop.signals.incl sh
+
+  var mask, omask: SigSet
+  discard posix.sigemptyset(mask)
+  discard posix.sigaddset(mask, signo)
+  discard posix.sigprocmask(SIG_BLOCK, mask, omask)
+
+  let fd = signalfd(-1, mask, 0)
+
+  sh.fdh = mainloop.add_fd(fd, posix.POLLIN, proc(fd: cint): bool =
+    return fn(signo)
+  )
+
+  sh
+
+
+proc stop*(mainloop: MainLoop) =
+  mainloop.running = false
 
 
 proc get_next_timeout_ms(mainloop: MainLoop): cint =
@@ -99,7 +137,7 @@ proc handle_timers(mainloop: MainLoop) =
 
 
 
-proc run_one(mainloop: MainLoop): bool =
+proc run_one(mainloop: MainLoop) =
 
   mainloop.t_now = hirestime()
   mainloop.handle_timers()
@@ -116,7 +154,8 @@ proc run_one(mainloop: MainLoop): bool =
   let nfds = fds.len
 
   if timeout == -1 and nfds == 0:
-    return false
+    mainloop.stop()
+    return
 
   let fdsaddr = if nfds > 0: addr fds[0] else: nil
   let nfds_ready = posix.poll(fdsaddr, fds.len.uint, timeout)
@@ -138,14 +177,13 @@ proc run_one(mainloop: MainLoop): bool =
   for fh in to_delete:
     mainloop.del_fd(fh)
 
-  return true
 
 
 
 proc run*(mainloop: MainLoop) =
-  while mainloop.run_one():
-    discard
-  echo "mainloop exit"
+  while mainloop.running:
+    mainloop.run_one()
+
 
 
 proc newLineSplitter(fn: proc(s: string)): LineSplitter =
@@ -196,5 +234,5 @@ proc spawn*(mainloop: MainLoop, cmd: string, on_line: proc(l: string)) =
 
   discard posix.close(fds[1])
 
-  discard mainloop.add_fd(fds[0], posix.POLLIN, on_data)
+  mainloop.add_fd(fds[0], posix.POLLIN, on_data)
 
