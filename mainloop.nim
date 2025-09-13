@@ -119,7 +119,6 @@ proc run_one(mainloop: MainLoop): bool =
     return false
 
   let fdsaddr = if nfds > 0: addr fds[0] else: nil
-
   let nfds_ready = posix.poll(fdsaddr, fds.len.uint, timeout)
  
   mainloop.t_now = hirestime()
@@ -156,7 +155,7 @@ proc newLineSplitter(fn: proc(s: string)): LineSplitter =
 
 proc put(ls: var LineSplitter, data: string) =
   
-  let p = peg(lines, ls: LineSplitter):
+  const p = peg(lines, ls: LineSplitter):
     lines <- *line
     line <- >+(1-'\n') * '\n':
       ls.fn($1)
@@ -166,15 +165,21 @@ proc put(ls: var LineSplitter, data: string) =
   ls.buf = ls.buf[r.matchLen..^1]
 
 
+proc prctl(what: cint, arg2: cint): cint {.importc: "prctl", header: "<sys/prctl.h>".}
+const PR_SET_PDEATHSIG = 1
+
+
 proc spawn*(mainloop: MainLoop, cmd: string, on_line: proc(l: string)) =
   var fds: array[2, cint]
   discard posix.pipe(fds)
 
   let pid = posix.fork()
   if pid == 0:
+    discard prctl(PR_SET_PDEATHSIG, posix.SIGKILL)
+    if posix.getppid() == 1: quit(1)
     discard posix.close(fds[0])
     discard posix.dup2(fds[1], posix.STDOUT_FILENO)
-    discard posix.dup2(fds[1], posix.STDERR_FILENO)
+    #discard posix.dup2(fds[1], posix.STDERR_FILENO)
     discard posix.close(fds[1])
     let args = ["/bin/sh", "-c", cmd]
     discard posix.execvp("/bin/sh", allocCStringArray(args))

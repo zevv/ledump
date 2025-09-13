@@ -54,51 +54,27 @@ type
     class: string
 
 
-let p = peg("btmon", ev: Evdata):
-
+const p = peg("btmon", ev: Evdata):
+  S <- *' '
   btmon <- event_device_found | event_le_meta | event_ext
-
-  event_device_found <- "@ MGMT Event: Device Found" * rest * lines:
-    ev.evtype = DeviceFound
-
+  event_device_found <- "@ MGMT Event: Device Found" * rest * lines: ev.evtype = DeviceFound
   event_le_meta <- "> HCI Event: LE Meta Event" * rest * lines
-
   event_ext <- "> HCI Event: Extended Inquiry Result" * rest * lines
-
   lines <- +(line * '\n')
   line <- S * (le_address | rssi | name | company | address_type | class | other)
-
-  le_address <- "Address: " * >btaddr * rest:
-    ev.btaddr = $1
-
-  rssi <- "RSSI: " * >int * rest:
-    ev.rssi = parseInt($1)
-
-  name <- "Name (complete): " * >rest:
-    ev.name = $1
-
-  company <- "Company: " * >rest:
-    ev.company = $1
-
-  class <- "Minor class: " * >rest:
-    ev.class = $1
-
+  le_address <- "Address: " * >btaddr * rest: ev.btaddr = $1
+  rssi <- "RSSI: " * >int * rest: ev.rssi = parseInt($1)
+  name <- "Name (complete): " * >rest: ev.name = $1
+  company <- "Company: " * >rest: ev.company = $1
+  class <- "Minor class: " * >rest: ev.class = $1
   address_type <- "Address type: " * (address_type_public | address_type_random) * rest
   address_type_public <- "Public": ev.address_type = AddressType.Public
   address_type_random <- "Random": ev.address_type = AddressType.Random
-
-  other <- >rest:
-    #echo "other> ", $1
-    discard
-
+  other <- >rest: discard
   rest <- *(1-'\n')
-
-
-
   btaddr <- twohex * ':' * twohex * ':' * twohex * ':' * twohex * ':' * twohex * ':' * twohex
   twohex <- Xdigit * Xdigit
   int <- ?{'+', '-'} * +Digit
-  S <- *' '
 
 
 proc handle_btmon(scanner: Scanner, lines: seq[string]) =
