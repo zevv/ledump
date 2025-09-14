@@ -1,5 +1,5 @@
 
-import std / [ tables, strutils, strformat, hashes, sets, posix ]
+import std / [ tables, strutils, strformat, hashes, sets, posix, deques ]
 import mainloop
 import npeg
 
@@ -73,10 +73,22 @@ type
     fingerprint: Hash
     services: Table[Uuid, Service]
 
+  WorkResultFn = proc(ok: bool)
+
+  WorkFn = proc(fn_res: WorkResultFn)
+
+  Work = ref object
+    id: int
+    name: string
+    fn: WorkFn
+
   Scanner = ref object
     loop: MainLoop
     nodes: Table[BtAddr, Node]
     btmon_data: seq[string]
+    workIdSeq: int
+    workQueue: Deque[Work]
+    workActive: Work
  
 
 
@@ -124,6 +136,37 @@ type
     service_data: string
 
 
+proc work_add(scanner: Scanner, name: string, fn: WorkFn) =
+  let work = new Work
+  work.id = scanner.workIdSeq
+  work.name = name
+  work.fn = fn
+  scanner.workQueue.addLast (work)
+  scanner.workIdSeq += 1
+  echo &">> work {work.id}: {name} queued"
+
+
+proc work_run(scanner: Scanner) =
+
+  if scanner.workActive != nil:
+    echo &">> work: active {scanner.workActive.id}: {scanner.workActive.name}"
+    return
+
+  if scanner.workQueue.len == 0:
+    echo ">> work: idle"
+    return
+
+  scanner.workActive = scanner.workQueue.popFirst()
+  echo &">> work {scanner.workActive.id}: {scanner.workActive.name} start"
+
+  proc work_cb(ok: bool) =
+    echo &">> work {scanner.workActive.id}: { scanner.workActive.name} done: {ok}"
+    if not ok:
+      scanner.workQueue.addLast(scanner.workActive)
+    scanner.workActive = nil
+    scanner.work_run()
+  
+  scanner.workActive.fn(work_cb)
 
 
 proc dump(node: Node, evtype: string, blob: string) =
@@ -133,56 +176,92 @@ proc dump(node: Node, evtype: string, blob: string) =
   f.close()
 
 
+proc discover_descriptors(scanner: Scanner, node: Node, characteristic: Characteristic) =
+
+  proc work(fn_res: WorkResultFn) =
+
+    proc on_data(s: string) =
+      echo s
+      fn_res(true)
+
+    echo &"-  Discovering descriptors on {node.btaddr} characteristic {uuid_name(characteristic.uuid)} handle {characteristic.handle}"
+    scanner.loop.spawn(&"gatttool -b {node.btaddr} --char-desc --start={characteristic.value_handle} --end={characteristic.value_handle}", on_data)
+   
+  scanner.work_add(&"discover_descriptors for {node.btaddr} {characteristic.uuid}", work)
+
+
 proc discover_characteristics(scanner: Scanner, node: Node, service: Service) =
 
-  # handle = 0x0002, char properties = 0x02, char value handle = 0x0003, uuid = 00002a00-0000-1000-8000-00805f9b34fb
-  let p = peg("characteristic", c: Characteristic):
-    characteristic <- handle * props * value * uuid:
-      c.handle = fromHex[int]($1)
-      c.properties = fromHex[int]($2)
-      c.value_handle = fromHex[int]($3)
-      c.uuid = $4
-    handle <- "handle = " * >("0x" * +Xdigit) * ", "
-    props <- "char properties = " * >("0x" * +Xdigit) * ", "
-    value <- "char value handle = " * >("0x" * +Xdigit) * ", "
-    uuid <- "uuid = " * >+(Xdigit | '-')
+  proc work(fn_res: WorkResultFn) =
 
-  proc on_line(l: string) =
-    var c = new Characteristic
-    let r = p.match(l, c)
-    if r.ok:
-      service.characteristics[c.uuid] = c
-      echo "- " , uuid_name(c.uuid)
-    else:
-      echo "failed to parse characteristic line at pos ", r.matchLen
+    let p = peg("characteristics", cs: Table[Uuid, Characteristic]):
+      characteristics <- +characteristic
+      characteristic <- handle * props * value * uuid * '\n':
+        let c = new Characteristic
+        c.handle = fromHex[int]($1)
+        c.properties = fromHex[int]($2)
+        c.value_handle = fromHex[int]($3)
+        c.uuid = $4
+        cs[c.uuid] = c
+      handle <- "handle = " * >("0x" * +Xdigit) * ", "
+      props <- "char properties = " * >("0x" * +Xdigit) * ", "
+      value <- "char value handle = " * >("0x" * +Xdigit) * ", "
+      uuid <- "uuid = " * >+(Xdigit | '-')
 
-  echo "-  Discovering characteristics on ", node.btaddr, " service ", service.uuid
-  scanner.loop.spawn(&"sudo gatttool -b {node.btaddr} --characteristics --start={service.start_handle} --end={service.end_handle}", on_line)
+    proc on_data(l: string) =
+      var cs: Table[Uuid, Characteristic]
+      let r = p.match(l, cs)
+      if r.ok:
+        for c in cs.values:
+          echo "  - Characteristic ", uuid_name(c.uuid), " handle ", $c.handle, " props ", $c.properties, " value_handle ", $c.value_handle
+          scanner.discover_descriptors(node, c)
+        service.characteristics = cs
+        fn_res(true)
+      else:
+        echo "failed to parse characteristic line at pos ", r.matchLen
+        fn_res(false)
+
+    echo "-  Discovering characteristics on ", node.btaddr, " service ", service.uuid
+    scanner.loop.spawn(&"gatttool -b {node.btaddr} --characteristics --start={service.start_handle} --end={service.end_handle}", on_data)
+
+  scanner.work_add(&"discover_characteristics for {node.btaddr} {service.uuid}", work)
+
 
 
 proc discover_services(scanner: Scanner, node: Node) =
 
-  let p = peg("service", s: Service):
-    service <- start_handle * end_handle * uuid:
-      s.start_handle = fromHex[int]($1)
-      s.end_handle = fromHex[int]($2)
-      s.uuid = $3
-    start_handle <- "attr handle = " * >("0x" * +Xdigit) * ", "
-    end_handle <- "end grp handle = " * >("0x" * +Xdigit) * " "
-    uuid <- "uuid: " * >+(Xdigit | '-')
-  
-  proc on_line(l: string) =
-    var s = new Service
-    let r = p.match(l, s)
-    if r.ok:
-      echo "- " , uuid_name(s.uuid)
-      node.services[s.uuid] = s
-      scanner.discover_characteristics(node, s)
-    else:
-      echo "failed to parse service line at pos ", r.matchLen
+  proc work(fn_res: WorkResultFn) =
 
-  echo "- Discovering services on ", node.btaddr
-  scanner.loop.spawn(&"sudo gatttool -b {node.btaddr} --primary", on_line)
+    let p = peg("services", ss: Table[Uuid, Service]):
+      services <- +service
+      service <- start_handle * end_handle * uuid * '\n':
+        let s = new Service
+        s.start_handle = fromHex[int]($1)
+        s.end_handle = fromHex[int]($2)
+        s.uuid = $3
+        ss[s.uuid] = s
+      start_handle <- "attr handle = " * >("0x" * +Xdigit) * ", "
+      end_handle <- "end grp handle = " * >("0x" * +Xdigit) * " "
+      uuid <- "uuid: " * >+(Xdigit | '-')
+    
+    proc on_stdout(l: string) =
+      echo l
+      var ss: Table[Uuid, Service]
+      let r = p.match(l, ss)
+      if r.ok:
+        for s in ss.values:
+          echo "  - Service ", uuid_name(s.uuid), " handles ", $s.start_handle, "-", $s.end_handle
+          scanner.discover_characteristics(node, s)
+        node.services = ss
+        fn_res(true)
+      else:
+        echo "failed to parse service line at pos ", r.matchLen
+        fn_res(false)
+
+    #echo "- Discovering services on ", node.btaddr
+    scanner.loop.spawn(&"gatttool -b {node.btaddr} --primary", on_stdout)
+
+  scanner.work_add(&"discover_services for {node.btaddr}", work)
 
 
 
@@ -228,7 +307,8 @@ proc handle_btmon(scanner: Scanner, lines: seq[string]) =
       node = Node(btaddr: ev.btaddr)
       scanner.nodes[ev.btaddr] = node
       #if ev.btaddr == "74:46:B3:84:EF:78":
-      #  scanner.discover_services(node)
+      if true:
+        scanner.discover_services(node)
       
 
     node.t_last_seen = scanner.loop.time()
@@ -257,6 +337,10 @@ proc dump(scanner: Scanner) =
   for n in scanner.nodes.values:
     let age = scanner.loop.time() - n.t_last_seen
     echo &"{n.btaddr} ({n.address_type}) {age:4.1f} {n.rssi:+4d} {n.name:20} {n.company:20} {n.class:10}"
+    for s in n.services.values:
+      echo &"  - {s.start_handle:04x}-{s.end_handle:04x}: Service {uuid_name(s.uuid)}"
+      for c in s.characteristics.values:
+        echo &"    - {c.handle:04x}: {uuid_name(c.uuid)} props {c.properties:02x} value_handle {c.value_handle:04x}"
 
 
 proc cleanup(scanner: Scanner) =
@@ -290,17 +374,20 @@ proc start(scanner: Scanner) =
       scanner.btmon_data = @[]
     scanner.btmon_data.add(l)
   
-  scanner.loop.spawn("sudo btmon --color never", on_btmon)
+  scanner.loop.spawn_stream("sudo btmon --color never", on_btmon)
 
-  proc on_bluetoothctl(l: string) =
-    #echo "c> ", l
-    discard
-  scanner.loop.spawn("sudo bluetoothctl -t -1 scan le", on_bluetoothctl)
-  scanner.loop.spawn("sudo bluetoothctl -t -1 scan on", on_bluetoothctl)
+  proc scan_work(fn_res: WorkResultFn) =
+    echo "- Scanning for LE devices"
+    scanner.loop.spawn("bluetoothctl -t 5 scan le", proc(l: string) =
+      fn_res(false)
+    )
+  scanner.work_add("scan", scan_work)
+  #scanner.loop.spawn("bluetoothctl -t -1 scan on")
 
   scanner.loop.add_timer(0.5, proc(): bool =
-    #scanner.dump()
+    scanner.dump()
     scanner.cleanup()
+    scanner.work_run()
     return true
   )
 

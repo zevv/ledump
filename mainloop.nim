@@ -1,5 +1,5 @@
 
-import std / [posix, tables, sequtils, sets, hashes]
+import std / [posix, tables, sequtils, sets, hashes, strutils ]
 import npeg
 
 type
@@ -207,23 +207,46 @@ proc prctl(what: cint, arg2: cint): cint {.importc: "prctl", header: "<sys/prctl
 const PR_SET_PDEATHSIG = 1
 
 
-proc spawn*(mainloop: MainLoop, cmd: string, on_line: proc(l: string)) =
+proc forkproc(mainloop: MainLoop, cmd: string): cint =
   var fds: array[2, cint]
   discard posix.pipe(fds)
-
   let pid = posix.fork()
   if pid == 0:
     discard prctl(PR_SET_PDEATHSIG, posix.SIGKILL)
     if posix.getppid() == 1: quit(1)
     discard posix.close(fds[0])
     discard posix.dup2(fds[1], posix.STDOUT_FILENO)
-    #discard posix.dup2(fds[1], posix.STDERR_FILENO)
+    discard posix.dup2(fds[1], posix.STDERR_FILENO)
     discard posix.close(fds[1])
     let args = ["/bin/sh", "-c", cmd]
     discard posix.execvp("/bin/sh", allocCStringArray(args))
     echo "execvp failed"
     quit(1)
+  discard posix.close(fds[1])
+  return fds[0]
 
+
+proc dummy(l: string) = 
+  discard l
+
+
+proc spawn*(mainloop: MainLoop, cmd: string, on_stdout: proc(l: string) = dummy) =
+  let fd = forkproc(mainloop, cmd)
+  var data_stdout: seq[string]
+  proc on_data(fd: cint): bool =
+    var buf = newString(1024)
+    let n = posix.read(fd, addr buf[0], buf.len)
+    if n > 0:
+      data_stdout.add buf[0..n-1]
+      return true
+    else:
+      on_stdout(data_stdout.join(""))
+      return false
+  mainloop.add_fd(fd, posix.POLLIN, on_data)
+
+
+proc spawn_stream*(mainloop: MainLoop, cmd: string, on_line: proc(l: string) = dummy) =
+  let fd = forkproc(mainloop, cmd)
   var splitter = newLineSplitter(on_line)
   var buf = newString(1024)
   proc on_data(fd: cint): bool =
@@ -231,8 +254,5 @@ proc spawn*(mainloop: MainLoop, cmd: string, on_line: proc(l: string)) =
     if n > 0:
        splitter.put(buf[0..n-1])
        return true
-
-  discard posix.close(fds[1])
-
-  mainloop.add_fd(fds[0], posix.POLLIN, on_data)
+  mainloop.add_fd(fd, posix.POLLIN, on_data)
 
