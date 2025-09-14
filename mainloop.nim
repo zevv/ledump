@@ -1,5 +1,5 @@
 
-import std / [posix, tables, sequtils, sets, hashes, strutils, strformat ]
+import std / [posix, tables, sequtils, sets, hashes, strutils, strformat, deques ]
 import npeg
 
 type
@@ -28,6 +28,17 @@ type
     interval: float
     t_next: float
     fn: TimerHandlerFn
+  
+  WorkResultFn* = proc(ok: bool)
+
+  WorkFn* = proc(fn_res: WorkResultFn)
+
+  Work = ref object
+    t_scheduled: float
+    t_started: float
+    id: int
+    name: string
+    fn: WorkFn
 
   MainLoop* = ref object
     t_now: float
@@ -35,6 +46,10 @@ type
     fds: HashSet[FdHandler]
     timers: HashSet[TimerHandler]
     signals: HashSet[SigHandler]
+
+    workIdSeq: int
+    workQueue: Deque[Work]
+    workActive: Work
 
   
 proc signalfd(fd: cint, mask: var Sigset, flags: cint): cint
@@ -109,6 +124,20 @@ proc add_signal*(mainloop: MainLoop, signo: cint, fn: FdHandlerFn): SigHandler {
   sh
 
 
+
+proc add_work*(mainloop: Mainloop, name: string, fn: WorkFn) =
+  let work = new Work
+  work.id = mainloop.workIdSeq
+  work.t_scheduled = mainloop.time()
+  work.name = name
+  work.fn = fn
+  mainloop.workQueue.addLast (work)
+  mainloop.workIdSeq += 1
+  echo &">> work {work.id}: {name} queued"
+
+
+
+
 proc stop*(mainloop: MainLoop) =
   mainloop.running = false
 
@@ -122,6 +151,35 @@ proc get_next_timeout_ms(mainloop: MainLoop): cint =
   else:
     return cint((t_next - mainloop.t_now) * 1000.0) + 1
   
+
+
+proc work_run(mainloop: Mainloop) =
+  
+  if mainloop.workQueue.len == 0:
+    stdout.write ">> work: idle\r"
+    stdout.flushFile()
+    return
+
+  if mainloop.workActive != nil:
+    let age = mainloop.time() - mainloop.workActive.t_started
+    stdout.write &">> work: active {mainloop.workActive.id}: {mainloop.workActive.name} ({age:.1f}s)\r"
+    stdout.flushFile()
+    return
+
+  mainloop.workActive = mainloop.workQueue.popFirst()
+  echo &">> work {mainloop.workActive.id}: {mainloop.workActive.name} start"
+
+  proc work_cb(ok: bool) =
+    echo &">> work {mainloop.workActive.id}: { mainloop.workActive.name} done: {ok}"
+    if not ok:
+      mainloop.workQueue.addLast(mainloop.workActive)
+    mainloop.workActive = nil
+    mainloop.work_run()
+  
+  mainloop.workActive.t_started = mainloop.time()
+  mainloop.workActive.fn(work_cb)
+
+
 
 proc handle_timers(mainloop: MainLoop) =
   var to_delete: seq[TimerHandler]
@@ -177,6 +235,7 @@ proc run_one(mainloop: MainLoop) =
   for fh in to_delete:
     mainloop.del_fd(fh)
 
+  mainloop.work_run()
 
 
 
