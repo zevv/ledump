@@ -325,8 +325,8 @@ proc handle_btmon(scanner: Scanner, lines: seq[string]) =
     if node == nil:
       node = Node(btaddr: ev.btaddr)
       scanner.nodes[ev.btaddr] = node
-      if ev.btaddr == "74:46:B3:84:EF:78":
-      #if true:
+      #if ev.btaddr == "74:46:B3:84:EF:78":
+      if true:
         scanner.discover_services(node)
       
 
@@ -354,11 +354,11 @@ proc dump(scanner: Scanner) =
     let age = scanner.loop.time() - n.t_last_seen
     echo &"{n.btaddr} ({n.address_type}) {age:4.1f} {n.rssi:+4d} {n.name:20} {n.company:20} {n.class:10}"
     for s in n.services.values.toseq.sorted:
-      echo &"- {s.start_handle:04x}:  srv {uuid_name(s.uuid)}"
+      echo &"  {s.start_handle:04x}:  srv {uuid_name(s.uuid)}"
       for c in s.characteristics.values:
-        echo &"- {c.handle:04x}:   chr {uuid_name(c.uuid)} props {c.properties:02x} value_handle {c.value_handle:04x}"
+        echo &"  {c.handle:04x}:   chr {uuid_name(c.uuid)} props {c.properties:02x} value_handle {c.value_handle:04x}"
         for d in c.descriptors.values:
-          echo &"- {d.handle:04x}:    dsc {uuid_name(d.uuid)} '{d.value}'"
+          echo &"  {d.handle:04x}:    dsc {uuid_name(d.uuid)} '{d.value}'"
 
 
 proc cleanup(scanner: Scanner) =
