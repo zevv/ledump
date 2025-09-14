@@ -1,5 +1,5 @@
 
-import std / [posix, tables, sequtils, sets, hashes, strutils ]
+import std / [posix, tables, sequtils, sets, hashes, strutils, strformat ]
 import npeg
 
 type
@@ -125,7 +125,7 @@ proc get_next_timeout_ms(mainloop: MainLoop): cint =
 
 proc handle_timers(mainloop: MainLoop) =
   var to_delete: seq[TimerHandler]
-  for th in mainloop.timers:
+  for th in mainloop.timers.toSeq:
     if mainloop.t_now >= th.t_next:
       let keep = th.fn()
       if keep:
@@ -207,22 +207,42 @@ proc prctl(what: cint, arg2: cint): cint {.importc: "prctl", header: "<sys/prctl
 const PR_SET_PDEATHSIG = 1
 
 
-proc forkproc(mainloop: MainLoop, cmd: string): cint =
+proc forkproc(mainloop: MainLoop, cmd: seq[string], on_data: proc(s: string)): cint =
   var fds: array[2, cint]
   discard posix.pipe(fds)
   let pid = posix.fork()
   if pid == 0:
     discard prctl(PR_SET_PDEATHSIG, posix.SIGKILL)
     if posix.getppid() == 1: quit(1)
+    discard posix.setsid()
     discard posix.close(fds[0])
     discard posix.dup2(fds[1], posix.STDOUT_FILENO)
     discard posix.dup2(fds[1], posix.STDERR_FILENO)
     discard posix.close(fds[1])
-    let args = ["/bin/sh", "-c", cmd]
-    discard posix.execvp("/bin/sh", allocCStringArray(args))
+    discard posix.execvp(cmd[0], allocCStringArray(cmd))
     echo "execvp failed"
     quit(1)
   discard posix.close(fds[1])
+
+  echo &"spawned {cmd} with pid {pid}"
+
+  mainloop.add_timer(5, proc(): bool =
+    echo &"timeout {cmd}, killing {pid}"
+    discard posix.kill(pid, posix.SIGKILL)
+    return false)
+
+  mainloop.add_fd(fds[0], posix.POLLIN, proc(fd: cint): bool =
+    var buf = newString(1024)
+    let n = posix.read(fd, addr buf[0], buf.len)
+    if n > 0:
+      on_data(buf[0..n-1])
+      return true
+    else:
+      echo &"process {cmd} exited"
+      on_data("")
+      return false
+  )
+
   return fds[0]
 
 
@@ -230,29 +250,19 @@ proc dummy(l: string) =
   discard l
 
 
-proc spawn*(mainloop: MainLoop, cmd: string, on_stdout: proc(l: string) = dummy) =
-  let fd = forkproc(mainloop, cmd)
-  var data_stdout: seq[string]
-  proc on_data(fd: cint): bool =
-    var buf = newString(1024)
-    let n = posix.read(fd, addr buf[0], buf.len)
-    if n > 0:
-      data_stdout.add buf[0..n-1]
-      return true
+proc spawn*(mainloop: MainLoop, cmd: seq[string], on_stdout: proc(l: string) = dummy) =
+  var stdout: seq[string]
+  proc on_data(data: string) =
+    if data != "":
+      stdout.add data
     else:
-      on_stdout(data_stdout.join(""))
-      return false
-  mainloop.add_fd(fd, posix.POLLIN, on_data)
+      on_stdout(stdout.join(""))
+  discard forkproc(mainloop, cmd, on_data)
 
 
-proc spawn_stream*(mainloop: MainLoop, cmd: string, on_line: proc(l: string) = dummy) =
-  let fd = forkproc(mainloop, cmd)
+proc spawn_stream*(mainloop: MainLoop, cmd: seq[string], on_line: proc(l: string) = dummy) =
   var splitter = newLineSplitter(on_line)
-  var buf = newString(1024)
-  proc on_data(fd: cint): bool =
-    let n = posix.read(fd, addr buf[0], buf.len)
-    if n > 0:
-       splitter.put(buf[0..n-1])
-       return true
-  mainloop.add_fd(fd, posix.POLLIN, on_data)
+  proc on_data(data: string) =
+    splitter.put(data)
+  discard forkproc(mainloop, cmd, on_data)
 

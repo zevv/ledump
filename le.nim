@@ -78,6 +78,8 @@ type
   WorkFn = proc(fn_res: WorkResultFn)
 
   Work = ref object
+    t_scheduled: float
+    t_started: float
     id: int
     name: string
     fn: WorkFn
@@ -139,6 +141,7 @@ type
 proc work_add(scanner: Scanner, name: string, fn: WorkFn) =
   let work = new Work
   work.id = scanner.workIdSeq
+  work.t_scheduled = scanner.loop.time()
   work.name = name
   work.fn = fn
   scanner.workQueue.addLast (work)
@@ -149,7 +152,8 @@ proc work_add(scanner: Scanner, name: string, fn: WorkFn) =
 proc work_run(scanner: Scanner) =
 
   if scanner.workActive != nil:
-    echo &">> work: active {scanner.workActive.id}: {scanner.workActive.name}"
+    let age = scanner.loop.time() - scanner.workActive.t_started
+    echo &">> work: active {scanner.workActive.id}: {scanner.workActive.name} ({age:.1f}s)"
     return
 
   if scanner.workQueue.len == 0:
@@ -166,6 +170,7 @@ proc work_run(scanner: Scanner) =
     scanner.workActive = nil
     scanner.work_run()
   
+  scanner.workActive.t_started = scanner.loop.time()
   scanner.workActive.fn(work_cb)
 
 
@@ -185,7 +190,13 @@ proc discover_descriptors(scanner: Scanner, node: Node, characteristic: Characte
       fn_res(true)
 
     echo &"-  Discovering descriptors on {node.btaddr} characteristic {uuid_name(characteristic.uuid)} handle {characteristic.handle}"
-    scanner.loop.spawn(&"gatttool -b {node.btaddr} --char-desc --start={characteristic.value_handle} --end={characteristic.value_handle}", on_data)
+    scanner.loop.spawn(@[
+      "gatttool",
+      "-b", node.btaddr,
+      "--char-desc",
+      "--start", $characteristic.value_handle,
+      "--end", $characteristic.value_handle
+    ], on_data)
    
   scanner.work_add(&"discover_descriptors for {node.btaddr} {characteristic.uuid}", work)
 
@@ -222,7 +233,14 @@ proc discover_characteristics(scanner: Scanner, node: Node, service: Service) =
         fn_res(false)
 
     echo "-  Discovering characteristics on ", node.btaddr, " service ", service.uuid
-    scanner.loop.spawn(&"gatttool -b {node.btaddr} --characteristics --start={service.start_handle} --end={service.end_handle}", on_data)
+    scanner.loop.spawn(@[
+      "gatttool",
+      "-b", node.btaddr,
+      "--characteristics",
+      "--start", $service.start_handle,
+      "--end", $service.end_handle
+    ], on_data)
+
 
   scanner.work_add(&"discover_characteristics for {node.btaddr} {service.uuid}", work)
 
@@ -259,7 +277,11 @@ proc discover_services(scanner: Scanner, node: Node) =
         fn_res(false)
 
     #echo "- Discovering services on ", node.btaddr
-    scanner.loop.spawn(&"gatttool -b {node.btaddr} --primary", on_stdout)
+    scanner.loop.spawn(@[
+      "gatttool",
+      "-b", node.btaddr,
+      "--primary"
+    ], on_stdout)
 
   scanner.work_add(&"discover_services for {node.btaddr}", work)
 
@@ -374,15 +396,22 @@ proc start(scanner: Scanner) =
       scanner.btmon_data = @[]
     scanner.btmon_data.add(l)
   
-  scanner.loop.spawn_stream("sudo btmon --color never", on_btmon)
+  scanner.loop.spawn_stream(@[
+    "sudo", 
+    "btmon", 
+    "--color", "never"
+  ], on_btmon)
 
   proc scan_work(fn_res: WorkResultFn) =
     echo "- Scanning for LE devices"
-    scanner.loop.spawn("bluetoothctl -t 5 scan le", proc(l: string) =
+    scanner.loop.spawn(@[
+      "bluetoothctl",
+      "-t", "5",
+      "scan", "le"
+    ], proc(l: string) =
       fn_res(false)
     )
   scanner.work_add("scan", scan_work)
-  #scanner.loop.spawn("bluetoothctl -t -1 scan on")
 
   scanner.loop.add_timer(0.5, proc(): bool =
     scanner.dump()
