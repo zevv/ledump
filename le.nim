@@ -53,10 +53,22 @@ type
     handle: int
     value: string
 
+  PropertyMasks = enum
+    Broadcast = 0x01
+    Read = 0x02
+    WriteWithoutResponse = 0x04
+    Write = 0x08
+    Notify = 0x10
+    Indicate = 0x20
+    AuthenticatedSignedWrites = 0x40
+    ExtendedProperties = 0x80
+
+  Properties = distinct int
+
   Characteristic = ref object
     uuid: string
     handle: int
-    properties: int
+    properties: Properties
     value_handle: int
     value: string
     descriptors: Table[Uuid, Descriptor]
@@ -89,6 +101,17 @@ proc `<`(a, b: Node): bool = a.btaddr < b.btaddr
 proc `<`(a, b: Service): bool = a.start_handle < b.start_handle
 proc `<`(a, b: Characteristic): bool = a.handle < b.handle
 proc `<`(a, b: Descriptor): bool = a.handle < b.handle
+
+
+proc `$`(p: Properties): string =
+  let v = p.int
+  let bits = "brwWniae"
+  for i in 0 ..< bits.len:
+    if (v and (1 shl i)) != 0:
+      result.add bits[i]
+    else:
+      result.add '-'
+
 
 
 
@@ -191,7 +214,8 @@ proc discover_descriptors(scanner: Scanner, node: Node, characteristic: Characte
       let r = p.match(s, ds)
       if r.ok:
         for d in ds.values:
-          scanner.read_handle(node, d)
+          if (characteristic.properties.int and PropertyMasks.Read.int) != 0:
+            scanner.read_handle(node, d)
         characteristic.descriptors = ds
       fn_res(r.ok)
 
@@ -213,7 +237,7 @@ proc discover_characteristics(scanner: Scanner, node: Node, service: Service) =
     characteristic <- handle * props * value * uuid * '\n':
       let c = new Characteristic
       c.handle = fromHex[int]($1)
-      c.properties = fromHex[int]($2)
+      c.properties = fromHex[int]($2).Properties
       c.value_handle = fromHex[int]($3)
       c.uuid = $4
       cs[c.uuid] = c
