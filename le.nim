@@ -48,12 +48,18 @@ type
     Public
     Random
 
+  Descriptor = ref object
+    uuid: string
+    handle: int
+    value: string
+
   Characteristic = ref object
     uuid: string
     handle: int
     properties: int
     value_handle: int
     value: string
+    descriptors: Table[Uuid, Descriptor]
 
   Service = ref object
     uuid: string
@@ -182,20 +188,37 @@ proc dump(node: Node, evtype: string, blob: string) =
 
 
 proc discover_descriptors(scanner: Scanner, node: Node, characteristic: Characteristic) =
+    
+  # handle = 0x0001, uuid = 00002800-0000-1000-8000-00805f9b34fb
+
+  let p = peg("descriptors", ds: Table[Uuid, Descriptor]):
+    descriptors <- +descriptor
+    descriptor <- handle * uuid * '\n':
+      let desc = new Descriptor
+      desc.handle = fromHex[int]($1)
+      desc.uuid = $2
+      ds[desc.uuid] = desc
+    handle <- "handle: " * >("0x" * +Xdigit) * ", "
+    uuid <- "uuid: " * >+(Xdigit | '-')
 
   proc work(fn_res: WorkResultFn) =
 
     proc on_data(s: string) =
-      echo s
+      var ds: Table[Uuid, Descriptor]
+      let r = p.match(s, ds)
+      if r.ok:
+        characteristic.descriptors = ds
+      else:
+        echo "failed to parse descriptor line at pos ", r.matchLen
+        echo s
       fn_res(true)
 
-    echo &"-  Discovering descriptors on {node.btaddr} characteristic {uuid_name(characteristic.uuid)} handle {characteristic.handle}"
     scanner.loop.spawn(@[
       "gatttool",
       "-b", node.btaddr,
       "--char-desc",
-      "--start", $characteristic.value_handle,
-      "--end", $characteristic.value_handle
+      "--start", &"0x{characteristic.handle:04x}",
+      "--end", $"0x{characteristic.value_handle:04x}"
     ], on_data)
    
   scanner.work_add(&"discover_descriptors for {node.btaddr} {characteristic.uuid}", work)
@@ -203,36 +226,34 @@ proc discover_descriptors(scanner: Scanner, node: Node, characteristic: Characte
 
 proc discover_characteristics(scanner: Scanner, node: Node, service: Service) =
 
-  proc work(fn_res: WorkResultFn) =
+  let p = peg("characteristics", cs: Table[Uuid, Characteristic]):
+    characteristics <- +characteristic
+    characteristic <- handle * props * value * uuid * '\n':
+      let c = new Characteristic
+      c.handle = fromHex[int]($1)
+      c.properties = fromHex[int]($2)
+      c.value_handle = fromHex[int]($3)
+      c.uuid = $4
+      cs[c.uuid] = c
+    handle <- "handle = " * >("0x" * +Xdigit) * ", "
+    props <- "char properties = " * >("0x" * +Xdigit) * ", "
+    value <- "char value handle = " * >("0x" * +Xdigit) * ", "
+    uuid <- "uuid = " * >+(Xdigit | '-')
 
-    let p = peg("characteristics", cs: Table[Uuid, Characteristic]):
-      characteristics <- +characteristic
-      characteristic <- handle * props * value * uuid * '\n':
-        let c = new Characteristic
-        c.handle = fromHex[int]($1)
-        c.properties = fromHex[int]($2)
-        c.value_handle = fromHex[int]($3)
-        c.uuid = $4
-        cs[c.uuid] = c
-      handle <- "handle = " * >("0x" * +Xdigit) * ", "
-      props <- "char properties = " * >("0x" * +Xdigit) * ", "
-      value <- "char value handle = " * >("0x" * +Xdigit) * ", "
-      uuid <- "uuid = " * >+(Xdigit | '-')
+  proc work(fn_res: WorkResultFn) =
 
     proc on_data(l: string) =
       var cs: Table[Uuid, Characteristic]
       let r = p.match(l, cs)
       if r.ok:
-        for c in cs.values:
-          echo "  - Characteristic ", uuid_name(c.uuid), " handle ", $c.handle, " props ", $c.properties, " value_handle ", $c.value_handle
-          scanner.discover_descriptors(node, c)
         service.characteristics = cs
+        for c in cs.values:
+          scanner.discover_descriptors(node, c)
         fn_res(true)
       else:
         echo "failed to parse characteristic line at pos ", r.matchLen
         fn_res(false)
 
-    echo "-  Discovering characteristics on ", node.btaddr, " service ", service.uuid
     scanner.loop.spawn(@[
       "gatttool",
       "-b", node.btaddr,
@@ -246,22 +267,23 @@ proc discover_characteristics(scanner: Scanner, node: Node, service: Service) =
 
 
 
+
 proc discover_services(scanner: Scanner, node: Node) =
 
+  let p = peg("services", ss: Table[Uuid, Service]):
+    services <- +service
+    service <- start_handle * end_handle * uuid * '\n':
+      let s = new Service
+      s.start_handle = fromHex[int]($1)
+      s.end_handle = fromHex[int]($2)
+      s.uuid = $3
+      ss[s.uuid] = s
+    start_handle <- "attr handle = " * >("0x" * +Xdigit) * ", "
+    end_handle <- "end grp handle = " * >("0x" * +Xdigit) * " "
+    uuid <- "uuid: " * >+(Xdigit | '-')
+  
   proc work(fn_res: WorkResultFn) =
 
-    let p = peg("services", ss: Table[Uuid, Service]):
-      services <- +service
-      service <- start_handle * end_handle * uuid * '\n':
-        let s = new Service
-        s.start_handle = fromHex[int]($1)
-        s.end_handle = fromHex[int]($2)
-        s.uuid = $3
-        ss[s.uuid] = s
-      start_handle <- "attr handle = " * >("0x" * +Xdigit) * ", "
-      end_handle <- "end grp handle = " * >("0x" * +Xdigit) * " "
-      uuid <- "uuid: " * >+(Xdigit | '-')
-    
     proc on_stdout(l: string) =
       echo l
       var ss: Table[Uuid, Service]
@@ -276,7 +298,6 @@ proc discover_services(scanner: Scanner, node: Node) =
         echo "failed to parse service line at pos ", r.matchLen
         fn_res(false)
 
-    #echo "- Discovering services on ", node.btaddr
     scanner.loop.spawn(@[
       "gatttool",
       "-b", node.btaddr,
@@ -363,6 +384,8 @@ proc dump(scanner: Scanner) =
       echo &"  - {s.start_handle:04x}-{s.end_handle:04x}: Service {uuid_name(s.uuid)}"
       for c in s.characteristics.values:
         echo &"    - {c.handle:04x}: {uuid_name(c.uuid)} props {c.properties:02x} value_handle {c.value_handle:04x}"
+        for d in c.descriptors.values:
+          echo &"      - {d.handle:04x}: {uuid_name(d.uuid)} value {d.value}"
 
 
 proc cleanup(scanner: Scanner) =
