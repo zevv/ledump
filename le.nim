@@ -79,17 +79,6 @@ type
     fingerprint: Hash
     services: Table[Uuid, Service]
 
-  WorkResultFn = proc(ok: bool)
-
-  WorkFn = proc(fn_res: WorkResultFn)
-
-  Work = ref object
-    t_scheduled: float
-    t_started: float
-    id: int
-    name: string
-    fn: WorkFn
-
   Scanner = ref object
     loop: MainLoop
     nodes: Table[BtAddr, Node]
@@ -156,14 +145,14 @@ proc work_add(scanner: Scanner, name: string, fn: WorkFn) =
 
 
 proc work_run(scanner: Scanner) =
+  
+  if scanner.workQueue.len == 0:
+    echo ">> work: idle"
+    return
 
   if scanner.workActive != nil:
     let age = scanner.loop.time() - scanner.workActive.t_started
     echo &">> work: active {scanner.workActive.id}: {scanner.workActive.name} ({age:.1f}s)"
-    return
-
-  if scanner.workQueue.len == 0:
-    echo ">> work: idle"
     return
 
   scanner.workActive = scanner.workQueue.popFirst()
@@ -198,27 +187,26 @@ proc discover_descriptors(scanner: Scanner, node: Node, characteristic: Characte
       desc.handle = fromHex[int]($1)
       desc.uuid = $2
       ds[desc.uuid] = desc
-    handle <- "handle: " * >("0x" * +Xdigit) * ", "
-    uuid <- "uuid: " * >+(Xdigit | '-')
+    handle <- "handle = " * >("0x" * +Xdigit) * ", "
+    uuid <- "uuid = " * >+(Xdigit | '-')
+    
 
   proc work(fn_res: WorkResultFn) =
 
     proc on_data(s: string) =
+      echo "\e[31;1m" & s & "\e[0m"
       var ds: Table[Uuid, Descriptor]
       let r = p.match(s, ds)
       if r.ok:
         characteristic.descriptors = ds
-      else:
-        echo "failed to parse descriptor line at pos ", r.matchLen
-        echo s
-      fn_res(true)
+      fn_res(r.ok)
 
     scanner.loop.spawn(@[
       "gatttool",
       "-b", node.btaddr,
       "--char-desc",
       "--start", &"0x{characteristic.handle:04x}",
-      "--end", $"0x{characteristic.value_handle:04x}"
+      "--end", &"0x{characteristic.value_handle:04x}"
     ], on_data)
    
   scanner.work_add(&"discover_descriptors for {node.btaddr} {characteristic.uuid}", work)
@@ -249,10 +237,7 @@ proc discover_characteristics(scanner: Scanner, node: Node, service: Service) =
         service.characteristics = cs
         for c in cs.values:
           scanner.discover_descriptors(node, c)
-        fn_res(true)
-      else:
-        echo "failed to parse characteristic line at pos ", r.matchLen
-        fn_res(false)
+      fn_res(r.ok)
 
     scanner.loop.spawn(@[
       "gatttool",
@@ -293,10 +278,9 @@ proc discover_services(scanner: Scanner, node: Node) =
           echo "  - Service ", uuid_name(s.uuid), " handles ", $s.start_handle, "-", $s.end_handle
           scanner.discover_characteristics(node, s)
         node.services = ss
-        fn_res(true)
       else:
         echo "failed to parse service line at pos ", r.matchLen
-        fn_res(false)
+      fn_res(r.ok)
 
     scanner.loop.spawn(@[
       "gatttool",
@@ -349,8 +333,8 @@ proc handle_btmon(scanner: Scanner, lines: seq[string]) =
     if node == nil:
       node = Node(btaddr: ev.btaddr)
       scanner.nodes[ev.btaddr] = node
-      #if ev.btaddr == "74:46:B3:84:EF:78":
-      if true:
+      if ev.btaddr == "74:46:B3:84:EF:78":
+      #if true:
         scanner.discover_services(node)
       
 
@@ -385,7 +369,7 @@ proc dump(scanner: Scanner) =
       for c in s.characteristics.values:
         echo &"    - {c.handle:04x}: {uuid_name(c.uuid)} props {c.properties:02x} value_handle {c.value_handle:04x}"
         for d in c.descriptors.values:
-          echo &"      - {d.handle:04x}: {uuid_name(d.uuid)} value {d.value}"
+          echo &"      - {d.handle:04x}: {uuid_name(d.uuid)} '{d.value}'"
 
 
 proc cleanup(scanner: Scanner) =

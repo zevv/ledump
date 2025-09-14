@@ -224,10 +224,10 @@ proc forkproc(mainloop: MainLoop, cmd: seq[string], on_data: proc(s: string)): c
     quit(1)
   discard posix.close(fds[1])
 
-  echo &"spawned {cmd} with pid {pid}"
+  echo &"spawned {pid}: {cmd}"
 
   mainloop.add_timer(5, proc(): bool =
-    echo &"timeout {cmd}, killing {pid}"
+    #echo &"timeout {cmd}, killing {pid}"
     discard posix.kill(pid, posix.SIGKILL)
     return false)
 
@@ -238,7 +238,7 @@ proc forkproc(mainloop: MainLoop, cmd: seq[string], on_data: proc(s: string)): c
       on_data(buf[0..n-1])
       return true
     else:
-      echo &"process {cmd} exited"
+      #echo &"process {cmd} exited"
       on_data("")
       return false
   )
